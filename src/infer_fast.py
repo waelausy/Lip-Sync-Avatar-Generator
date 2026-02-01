@@ -93,6 +93,25 @@ def infer_fast(
 
     print(f"Processing {n_frames} frames (max {max_frames})...")
 
+    # --- PRÉPARATION AUDIO (AVANT LA BOUCLE) ---
+    print(f"Audio shape (original): {mel.shape}")
+    
+    # 1. Ajuster la longueur : on veut être sûr d'avoir assez d'audio pour n_frames + MEL_WIN
+    # On ajoute une marge de sécurité
+    target_len = n_frames + MEL_WIN * 2
+    if mel.shape[1] < target_len:
+        pad_len = target_len - mel.shape[1]
+        print(f"Extending audio by {pad_len} frames")
+        # Utiliser 'edge' padding sur mel directement est plus sûr que repeat manuel si vide
+        pad = np.repeat(mel[:, -1:], pad_len, axis=1)
+        mel = np.concatenate([mel, pad], axis=1)
+
+    # 2. Padding pour centrer la fenêtre
+    pad_w = MEL_WIN // 2
+    mel_padded = np.pad(mel, ((0, 0), (pad_w, pad_w)), mode='edge')
+    print(f"Audio shape (padded): {mel_padded.shape}")
+    # -------------------------------------------
+
     for i in range(n_frames):
         ok, frame = cap.read()
         if not ok:
@@ -130,18 +149,27 @@ def infer_fast(
         x_masked = crop.copy()
         x_masked[mask > 0] = 0
 
-        # Audio conditioning
-        t = min(i, audio_frames - MEL_WIN)
-        mel_chunk = mel[:, t:t+MEL_WIN]
+        # Audio conditioning (Extraction simple maintenant)
+        # i dans la vidéo correspond à i+pad_w dans mel_padded
+        # On veut une fenêtre de taille MEL_WIN centrée
+        mel_chunk = mel_padded[:, i : i + MEL_WIN]
+
+        # Sécurité ultime (normalement inutile avec le padding ci-dessus)
+        if mel_chunk.shape[1] != MEL_WIN:
+             mel_chunk = np.pad(mel_chunk, ((0,0), (0, MEL_WIN - mel_chunk.shape[1])), mode='edge')
 
         # Forward pass
-        x_tensor = torch.from_numpy(x_masked.transpose(2, 0, 1)[np.newaxis, ...] / 255.0).float().to(dev)
+        # IMPORTANT: Convertir BGR -> RGB car le modèle a été entraîné en RGB
+        x_masked_rgb = cv2.cvtColor(x_masked, cv2.COLOR_BGR2RGB)
+        x_tensor = torch.from_numpy(x_masked_rgb.transpose(2, 0, 1)[np.newaxis, ...] / 255.0).float().to(dev)
         mel_tensor = torch.from_numpy(mel_chunk[np.newaxis, np.newaxis, ...]).float().to(dev)
 
         with torch.no_grad():
             yhat = net(x_tensor, mel_tensor).cpu().numpy()[0]
 
         yhat = np.clip(yhat.transpose(1, 2, 0) * 255.0, 0, 255).astype(np.uint8)
+        # IMPORTANT: Convertir RGB -> BGR pour l'affichage OpenCV
+        yhat = cv2.cvtColor(yhat, cv2.COLOR_RGB2BGR)
         yhat = cv2.resize(yhat, (x1i-x0i, y1i-y0i), interpolation=cv2.INTER_AREA)
 
         # Seamless clone

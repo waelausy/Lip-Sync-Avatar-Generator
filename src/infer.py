@@ -9,6 +9,7 @@ import numpy as np
 import librosa
 import mediapipe as mp
 import torch
+import subprocess
 
 from .config import IMG_SIZE, SR, N_MELS, MEL_WIN, FPS_FALLBACK, MOUTH_PAD, EMA_ALPHA, DEVICE
 from .model import HygieUNetLite
@@ -68,13 +69,21 @@ def infer(
     t = 0
 
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    audio_frames = mel.shape[1]
     
-    if mel.shape[1] < n_frames:
-        pad = np.repeat(mel[:, -1:], n_frames - mel.shape[1], axis=1)
+    print(f"Processing {n_frames} frames...")
+
+    # --- PRÉPARATION AUDIO (AVANT LA BOUCLE) ---
+    # 1. Ajuster la longueur : on veut être sûr d'avoir assez d'audio pour n_frames + MEL_WIN
+    target_len = n_frames + MEL_WIN * 2
+    if mel.shape[1] < target_len:
+        pad_len = target_len - mel.shape[1]
+        pad = np.repeat(mel[:, -1:], pad_len, axis=1)
         mel = np.concatenate([mel, pad], axis=1)
 
-    print(f"Processing {n_frames} frames...")
+    # 2. Padding pour centrer la fenêtre
+    pad_w = MEL_WIN // 2
+    mel_padded = np.pad(mel, ((0, 0), (pad_w, pad_w)), mode='edge')
+    # -------------------------------------------
 
     while True:
         ok, frame = cap.read()
@@ -109,19 +118,24 @@ def infer(
         x_masked = crop_rs.copy()
         x_masked[mask > 0] = 0
 
-        a0 = max(0, t - MEL_WIN // 2)
-        a1 = a0 + MEL_WIN
-        if a1 > mel.shape[1]:
-            a0 = mel.shape[1] - MEL_WIN
-            a1 = mel.shape[1]
-        mel_chunk = mel[:, a0:a1][None, None, ...]
+        # Audio conditioning avec alignement corrigé
+        mel_chunk = mel_padded[:, t : t + MEL_WIN]
+        
+        # Sécurité ultime
+        if mel_chunk.shape[1] != MEL_WIN:
+             mel_chunk = np.pad(mel_chunk, ((0,0), (0, MEL_WIN - mel_chunk.shape[1])), mode='edge')
+        
+        mel_chunk = mel_chunk[None, None, ...]
 
+        # IMPORTANT: Convertir BGR -> RGB pour le modèle
         x_rgb = cv2.cvtColor(x_masked, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         x_t = torch.from_numpy(x_rgb).permute(2, 0, 1).unsqueeze(0).to(dev)
         a_t = torch.from_numpy(mel_chunk).to(dev)
 
         with torch.no_grad():
             yhat = net(x_t, a_t)[0].permute(1, 2, 0).cpu().numpy()
+        
+        # IMPORTANT: Convertir RGB -> BGR pour OpenCV
         yhat_bgr = cv2.cvtColor((yhat * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
         center = ((x0i + x1i) // 2, (y0i + y1i) // 2)
@@ -150,7 +164,31 @@ def infer(
     cap.release()
     vw.release()
     mp_face.close()
-    print(f"Saved: {out_video}")
+    
+    # AJOUTER L'AUDIO avec ffmpeg (optionnel si le user veut le son direct, mais infer.py ne le faisait pas avant. Ajoutons le pour être complet)
+    # Pour l'instant infer.py sort juste la video muette si je suis le code original, mais infer_fast ajoutait l'audio.
+    # Le user a demandé "avoir la voix". Ajoutons-le.
+    
+    # Mais attention, infer.py n'utilisait pas de fichier temporaire avant.
+    # Modifions pour utiliser un temp et merger.
+    
+    temp_video = out_video + ".temp.mp4"
+    os.rename(out_video, temp_video)
+    
+    print("Adding audio...")
+    cmd = [
+        "ffmpeg", "-y", "-i", temp_video, "-i", audio_wav,
+        "-c:v", "copy", "-c:a", "aac", "-shortest",
+        out_video
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        os.remove(temp_video)
+        print(f"Saved: {out_video}")
+    except subprocess.CalledProcessError:
+        print("Warning: ffmpeg audio merge failed. Outputting video without audio.")
+        os.rename(temp_video, out_video) # Restore original
+
     return out_video
 
 
